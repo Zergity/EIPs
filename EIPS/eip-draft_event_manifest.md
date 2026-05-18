@@ -66,6 +66,15 @@ The manifest plugs into both standards without modification:
 
 The design choices above (global coverage, per-item bijection, exact/range/union predicates, declaration-ordered tuples but order-independent set-matching) are the minimal set that satisfies all three goals at once. Granting any further freedom (an undeclared address emitting anything, or one item discharging multiple logs) would erode anti-phishing; requiring any further constraint (order-preserving matching, or a single count predicate covering N occurrences) would erode versatility.
 
+#### Secondary benefit: heuristic conflict map for block-level parallelism
+
+Beyond the user-facing properties above, the manifest's global emitter whitelist gives block proposers a richer execution-graph hint than legacy access lists alone provide. Every `TX_TYPE` transaction enumerates every contract that emits during its execution — a near-complete enumeration of the contracts the transaction *touches*, since most state-changing paths emit at least one event. Combined with the storage slots declared under [EIP-2930](./eip-2930.md) / [EIP-7928](./eip-7928.md), the proposer has a fuller read/write footprint per transaction at block-assembly time:
+
+- Two `TX_TYPE` transactions whose emitter sets and storage-key sets are disjoint are strong candidates for parallel execution — neither can touch state the other reads or writes.
+- Transactions that share an emitter (e.g. both touching the same router) fall back to ordered execution or per-slot conflict analysis.
+
+The signal is heuristic, not exhaustive: pure read-only paths emit nothing, and an emitter can `CALL` into contracts that themselves write state without appearing in the manifest. But it is strictly richer than the legacy access list, and proposers running EIP-7928-style parallel execution can prefer manifest-bearing transactions for tighter conflict prediction. Wallets and bundlers SHOULD treat the parallelism hint as a side benefit of authoring tight manifests, not as a reason to over-broaden them.
+
 ## Specification
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) and [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174).
