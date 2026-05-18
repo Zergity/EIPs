@@ -20,7 +20,7 @@ Reuses and extends the EIP-2930 `access_list` field. Storage slots keep their ad
 
 Today, a user signing a transaction commits to calldata, not to outcomes. Their wallet simulates the call and shows what it expects to happen, but nothing in the protocol binds execution to that expectation. If the contract behaves differently — due to a malicious frontend, a proxy upgrade, state drift between sign and inclusion, or a routing change — the user has no recourse.
 
-Existing mitigations are partial: protocol-specific slippage checks (`amountOutMin`), wallet-side simulation, off-chain transaction screening. None generalize and none are enforced by the protocol.
+Existing mitigations are partial: protocol-specific slippage checks (`amountOutMin`), wallet-side simulation, off-chain transaction screening. Even with ERC-7730 clear-signing metadata rendering the user's intended outcome in human-readable form, the wallet only shows what it *expects*; nothing binds execution to that rendering. None of these generalize, and none are enforced by the protocol.
 
 This EIP introduces a primitive for the signer to declare, atomically with the transaction, what observable outcomes must hold. Outcomes are expressed as predicates over emitted events — the EVM's existing, ABI-typed, layout-independent signal for "something happened." The manifest is enforced at the end of execution; if any declared event is missing or any predicate fails, the transaction reverts.
 
