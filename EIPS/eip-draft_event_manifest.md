@@ -14,7 +14,7 @@ requires: 1559, 2718, 2930, 7702, 7981
 
 Introduces a new transaction type carrying an event manifest: a signed, enforced declaration of which log events the transaction must emit and — for the contracts it covers — the only events those contracts may emit. The EVM checks the manifest at the end of execution; mismatch reverts the transaction.
 
-Reuses and extends the EIP-2930 `access_list` field. Existing access list entries (storage slots) keep their advisory semantics. New entries declare required events.
+Reuses and extends the EIP-2930 `access_list` field. Storage slots keep their advisory warming semantics; entries gain an event constraint that declares required, permitted, or forbidden emissions.
 
 ## Motivation
 
@@ -100,25 +100,41 @@ All fields except `access_list` have the same meaning as in EIP-7702. `TX_TYPE` 
 ```
 access_list = [entry, entry, ...]
 
-entry = [address, [item, item, ...]]
+entry = [address, storage_slots, event_constraint]   # always length 3
 
-item = bytes32                                       # storage slot (advisory)
-     | [topic_predicates, data_predicates]           # event constraint
+storage_slots    = [bytes32, bytes32, ...]            # possibly empty (no slots warmed)
 
-topic_predicates  = [param_predicate, ...]           # 0..4 entries
-data_predicates   = [param_predicate, ...]           # 0..N entries
+event_constraint = []                                  # empty list   → any-emit (no constraint)
+                 | [item, item, ...]                   # non-empty list → strict bijection
+                 | 0x                                  # empty string → forbid: MUST NOT emit
 
-param_predicate = bytes32                            # shorthand for a single-member union of one exact value
-                | [member, member, ...]              # union; [] = wildcard
-member          = bytes32                            # exact match X (shorthand for [X, X])
-                | [bytes32, bytes32]                 # inclusive range [min, max]
+item              = [topic_predicates, data_predicates]
+topic_predicates  = [param_predicate, ...]            # 0..4 entries
+data_predicates   = [param_predicate, ...]            # 0..N entries
+
+param_predicate = bytes32                              # shorthand for a single-member union of one exact value
+                | [member, member, ...]                # union; [] = wildcard
+member          = bytes32                              # exact match X (shorthand for [X, X])
+                | [bytes32, bytes32]                   # inclusive range [min, max]
 ```
 
-Items are disambiguated by RLP type: a string is a storage slot, a list is an event constraint. No tag bytes. The term `entry` always refers to a top-level access-list entry `[address, [item, ...]]`; the term `member` is reserved for the elements of a union inside a `param_predicate`.
+Each entry is exactly three positional elements: an address, a list of storage slots to warm, and an event constraint declaring what (if anything) the address may emit. Storage warming and emission constraint are independent: any combination of (zero or more slots) and (any-emit / forbid / bijection) is valid.
 
-#### Storage items
+The three forms of `event_constraint` are RLP-distinguishable by type and length:
 
-A storage slot in an entry is advisory, identical to EIP-2930. The slot is added to `accessed_storage_keys` for warming. No post-execution check.
+| Encoding | RLP head byte | Reads as | Meaning |
+|---|---|---|---|
+| `[]` (empty list) | `0xc0` | "no constraint" | Any-emit: this address MAY emit any logs; emissions are not bijection-matched. |
+| `[item, item, ...]` (non-empty list) | `0xc1+` | "exactly these" | Strict bijection: this address MUST emit exactly these logs, 1:1 with items, under §"Matching". |
+| `0x` (empty byte string) | `0x80` | "forbid" | This address MUST NOT emit any log; any emission triggers the same revert as an undeclared emitter. |
+
+A non-empty byte string at the `event_constraint` position is invalid; implementations MUST reject any entry whose third element is a string other than `0x`. The empty-string sentinel is the natural opposite of the empty-list wildcard at the same position: both encode in a single RLP byte, differ only in RLP's type-tag bit, and read together as "list = constrain by enumeration; string = constrain by prohibition." No new sentinel bytes, no magic values.
+
+The term `entry` always refers to a top-level 3-tuple. The term `item` is reserved for an element of `event_constraint`'s list form. The term `member` is reserved for elements of a union inside a `param_predicate`.
+
+#### Storage slots
+
+The `storage_slots` list is advisory, byte-for-byte identical in semantics to the EIP-2930 access list. Each slot is added to `accessed_storage_keys` for warming at transaction start; subsequent `SLOAD`/`SSTORE` against the slot pay warm-access prices. There is no post-execution check on storage and storage warming grants no emission rights.
 
 #### Event items
 
@@ -202,16 +218,24 @@ Consequences of the bijection:
 - To permit `N` logs satisfying the same predicate, the manifest MUST declare the item `N` times. Identical items are interchangeable under the greedy match.
 - When two items in the same address group could match the same log (overlapping predicates), the one declared earlier wins. Wallets SHOULD declare specific items before broader ones to avoid a specific log being consumed by a broader item and leaving the specific item unmatched.
 
-**The manifest is the complete declaration of every emission in the transaction.** Any contract that emits a log during the transaction MUST appear in the access list with at least one matching event item. Addresses that do not appear in the access list, or that appear with only storage items, MUST emit zero logs; any emission from such an address causes the transaction to revert. Storage-only entries continue to warm state but grant no emission rights.
+**The manifest is the complete declaration of every emission in the transaction.** Every emission must be authorized by the entry covering its emitter:
+
+- An address absent from the access list MUST emit zero logs; any emission causes the transaction to revert (undeclared-emitter rule).
+- An address present with `event_constraint = 0x` MUST emit zero logs; any emission causes the transaction to revert (forbid rule).
+- An address present with `event_constraint = []` MAY emit any logs; emissions are authorized but not bijection-matched.
+- An address present with `event_constraint = [item, ...]` MUST emit exactly the declared logs in 1:1 correspondence with items, under the bijection above.
+
+The forbid form (`0x`) and address-omission are semantically equivalent at runtime; the forbid form exists to let a wallet warm storage slots on an address while still prohibiting all emissions from it.
 
 ### Enforcement
 
 Enforcement is performed inline with execution, not as a post-execution pass:
 
-1. At transaction start, for each declared address with one or more event items, initialize an ordered queue of unconsumed items in declaration order.
-2. Whenever a `LOG0..LOG4` opcode emits a log:
-   a. If the emitting address has no event items declared (absent from the access list, or present with only storage items), record a *manifest-violation marker* against the current call frame and continue execution (see §"Frame journaling" below).
-   b. Otherwise, scan the emitting address's queue in declaration order and consume the first item the log satisfies. Remove that item from the queue and journal the consumption against the current frame. If no item in the queue matches, record a manifest-violation marker against the current frame and continue execution.
+1. At transaction start, for each entry whose `event_constraint` is a non-empty list, initialize an ordered queue of unconsumed items in declaration order.
+2. Whenever a `LOG0..LOG4` opcode emits a log, classify the emitting address by its access-list entry and act:
+   a. **No entry**, or **entry with `event_constraint = 0x` (forbid)**: record a *manifest-violation marker* against the current call frame and continue execution (see §"Frame journaling" below).
+   b. **Entry with `event_constraint = []` (any-emit)**: no action; the emission is authorized and not bijection-matched.
+   c. **Entry with `event_constraint = [item, ...]` (bijection)**: scan the queue in declaration order and consume the first item the log satisfies. Remove that item from the queue and journal the consumption against the current frame. If no item in the queue matches, record a manifest-violation marker against the current frame and continue execution.
 3. At the end of transaction execution, immediately before committing state changes, both of the following MUST hold; if either fails, the transaction reverts as a top-level exceptional halt:
    - Every declared address's queue is empty.
    - No manifest-violation marker survives in the outermost frame's journal.
@@ -220,7 +244,7 @@ Enforcement is performed inline with execution, not as a post-execution pass:
 
 This makes the manifest a deterministic function of the *surviving* log set only: an emission inside a frame that subsequently reverts is invisible to the EVM and equally invisible to the verifier. Implementations MAY perform the matching eagerly at each `LOG` opcode (recommended; the typical no-revert path detects malformed manifests on the first violating emission and avoids wasting further compute) or lazily over the surviving log set at end-of-execution. Both modes MUST produce identical accept/reject outcomes for every transaction; a violation discovered eagerly inside a frame that later reverts MUST be discarded along with that frame's other journaled state.
 
-**Top-level exceptional halt.** A manifest violation that survives to the outermost frame's commit — any surviving violation marker, or any non-empty queue at end of execution — is a transaction-level exceptional halt analogous to out-of-gas: the entire transaction's state changes are discarded, the sender pays gas up to the point of detection, and no returndata is produced. The halt is NOT a frame-level `REVERT` and cannot be caught by a parent `CALL`/`STATICCALL`/`try` — once a marker is folded into the outermost frame's journal it can no longer be discarded by any subsequent revert. Storage items by themselves grant no emission rights and otherwise trigger no halts.
+**Top-level exceptional halt.** A manifest violation that survives to the outermost frame's commit — any surviving violation marker, or any non-empty queue at end of execution — is a transaction-level exceptional halt analogous to out-of-gas: the entire transaction's state changes are discarded, the sender pays gas up to the point of detection, and no returndata is produced. The halt is NOT a frame-level `REVERT` and cannot be caught by a parent `CALL`/`STATICCALL`/`try` — once a marker is folded into the outermost frame's journal it can no longer be discarded by any subsequent revert. Storage warming by itself triggers no halts and no journaled markers.
 
 ### Gas Costs
 
@@ -234,7 +258,27 @@ intrinsic_cost +=
   + ACCESS_LIST_DATA_COST         * access_list_data_bytes
 ```
 
-`access_list_data_bytes` is the total RLP byte count of the access list's payload, computed identically to EIP-7981 (which currently counts the 20-byte address per entry and the 32 bytes per storage key); event items contribute their RLP-encoded topic and data predicates by the same byte-count rule.
+Under the 3-tuple entry grammar:
+
+- `num_addresses` is the number of entries.
+- `num_storage_items` is the total length of every entry's `storage_slots` list.
+- `num_event_items` is the total length of every entry's `event_constraint` when in its non-empty-list form (any-emit `[]` and forbid `0x` contribute zero).
+- `access_list_data_bytes` is computed per entry and summed:
+
+  ```
+  access_list_data_bytes = Σ_entries (20
+                                    + 32 * len(storage_slots)
+                                    + rlp_size(event_constraint))
+  ```
+
+  Addresses and storage keys retain EIP-7981's payload-only count (20 bytes per address, 32 bytes per storage key, framing not charged). The `event_constraint` field is charged its **full RLP-encoded byte length**, including all framing (outer list header, per-item list headers, predicate-union list headers, range 2-list headers, and member string headers). This is intentional and differs from the addresses/storage-keys rule: predicate trees can nest several levels deep, so framing is a meaningful fraction of the on-wire footprint and must be priced to prevent gaming via deep wrappers.
+
+  Concretely:
+  - Any-emit `[]` contributes 1 byte (`0xc0`).
+  - Forbid `0x` contributes 1 byte (`0x80`).
+  - A non-empty event-constraint list contributes its full RLP encoding. A bare `bytes32` predicate value contributes 33 bytes (`0xa0` prefix + 32 payload); a range `[[A, B]]` at a predicate position contributes 70 bytes (the figure exercised by Test Case 11). A fully-pinned `LOG4` event item — four bare-bytes32 topic predicates plus `N` bare data-predicate words — contributes roughly `1 + (1 + 4 * 33) + (1 + N * 33)` bytes of framing-plus-payload.
+
+  This split keeps EIP-7981's address/slot accounting bit-for-bit identical for the legacy fields while giving predicates a regime that scales with their actual wire size.
 
 | Constant | Value | Source |
 |---|---|---|
@@ -249,9 +293,27 @@ intrinsic_cost +=
 
 Existing transaction types (`0x01`, `0x02`, `0x04`, and any other type pre-dating this EIP) keep the EIP-2930 access list grammar (entries are 2-tuples `[address, [slot, ...]]`). Their semantics are unchanged.
 
-The new transaction type `TX_TYPE` (single byte, assigned by EIP editors at inclusion) uses the extended grammar above. A type-`TX_TYPE` transaction with only storage items behaves identically to a type-`0x02` or type-`0x04` transaction with the same access list, except for the new type byte and intrinsic gas accounting.
+The new transaction type `TX_TYPE` (single byte, assigned by EIP editors at inclusion) uses the 3-tuple grammar above. The 3-tuple shape is **not** RLP-compatible with the EIP-2930 2-tuple shape: a `TX_TYPE` transaction MUST encode every entry with three positional elements, and a legacy access list cannot be reused byte-for-byte in a `TX_TYPE` transaction.
 
-A type-`TX_TYPE` transaction with an empty `access_list` is well-formed and bans all emissions for the entire transaction: any `LOG` opcode from any address causes an immediate revert under the "undeclared emitter" rule. This is the maximally restrictive manifest and is the natural mode for transactions whose authorized observable effect is "nothing emits."
+A type-`TX_TYPE` transaction whose entries all carry `event_constraint = []` imposes no constraint on emissions and is observationally equivalent to a type-`0x02` transaction with the same storage slots, modulo the new type byte and the intrinsic gas line item. A `TX_TYPE` transaction with an empty `access_list` is well-formed and forbids all emissions for the entire transaction: any `LOG` opcode from any address causes an immediate revert under the undeclared-emitter rule. This is the maximally restrictive manifest and is the natural mode for transactions whose authorized observable effect is "nothing emits."
+
+### Legacy access list promotion
+
+Wallets that promote a legacy access list into a `TX_TYPE` transaction MUST widen each entry `[ADDR, [K, ...]]` to the any-emit form `[ADDR, [K, ...], []]`. Silently widening to the forbid form `[ADDR, [K, ...], 0x]` would convert a permissive legacy entry into a restrictive manifest constraint and almost always cause unintended reverts; the forbid form MUST be surfaced only when the user (or dapp) explicitly authors it.
+
+The two 3-tuple shapes look almost identical but mean opposite things:
+
+| Form | Tx type | Manifest applied? | Means |
+|---|---|---|---|
+| `[ADDR, [K]]`        | legacy (0x01 / 0x02 / 0x04) | no                  | warm `K`; emissions unrestricted (no manifest exists) |
+| `[ADDR, [K], []]`    | `TX_TYPE`                   | yes                 | warm `K`; any-emit (manifest declares no constraint on `ADDR`) |
+| `[ADDR, [K], 0x]`    | `TX_TYPE`                   | yes                 | warm `K`; **forbid** all emissions from `ADDR` |
+
+The legacy 2-tuple maps semantically onto the **3-tuple any-emit form**, not onto the forbid form.
+
+### Wallet rendering
+
+Wallets MUST render any-emit entries (those with `event_constraint = []`) as a distinct, prominent class — not as fine-print bullets — because an any-emit entry authorizes the address to emit any logs without further constraint. Suggested copy: "⚠ Contract `ADDR` is authorized to emit any events." This is a load-bearing UX rule: the on-chain shape is meaningless if a phishing dapp can slip an any-emit entry past a user who expected a bijection. Forbid entries SHOULD also be rendered explicitly, as a positive declaration that no emissions are permitted from the address.
 
 ## Rationale
 
@@ -332,22 +394,49 @@ Coverage is global. Every contract that emits during the transaction — includi
 
 A wildcard event item (`[[sig], []]` — signature pinned via the bare-bytes32 shorthand, all other topics and data unconstrained) admits any single event with that signature from the address; declare it once per expected occurrence, and declare it AFTER any more specific items for the same signature.
 
-### Storage items kept advisory
+### Storage slots kept advisory
 
 Storage post-value predicates were considered and removed. They require sub-slot bit-level addressing (packed Solidity slots), a separate predicate language for storage post-values, and protocol-level understanding of storage layouts that varies between contracts. Event predicates achieve nearly the same user-facing goals without the encoding complexity or VM coupling.
 
-Storage items remain in the grammar in their EIP-2930 form because they are still useful for warming and for EIP-7928 parallelization. Their on-chain semantics are byte-for-byte identical to EIP-2930:
+Storage slots remain in the grammar in their EIP-2930 form because they are still useful for warming and for EIP-7928 parallelization. They live at the `storage_slots` position of each entry, peer to `event_constraint`, so an address can declare any combination of (slot warming, emission constraint) independently:
 
-- A storage item is a 32-byte string (RLP type discriminates it from an event item, which is a list).
-- It is added to `accessed_storage_keys` for warming at transaction start; subsequent `SLOAD`/`SSTORE` against the slot pay warm-access prices.
-- It carries no post-execution check, no emission rights, and no participation in the bijection — even on a type-`TX_TYPE` transaction whose other items are events.
-- Encoding and intrinsic gas charging (per item plus per RLP byte) match EIP-2930 / EIP-7981 exactly, including the constant name `ACCESS_LIST_STORAGE_KEY_COST`.
+| Entry | Slot warming | Emission constraint |
+|---|---|---|
+| `[ADDR, [], []]`           | none      | any-emit |
+| `[ADDR, [K], []]`          | `K` warm  | any-emit |
+| `[ADDR, [K], 0x]`          | `K` warm  | forbid (no emissions allowed) |
+| `[ADDR, [K], [item, ...]]` | `K` warm  | bijection over the listed items |
 
-A type-`TX_TYPE` transaction whose access list contains only storage items is therefore observationally identical to a type-`0x02` transaction with the same access list, except for the new type byte and the intrinsic gas line item — confirming the no-regression backwards-compatibility claim in §"Backwards Compatibility".
+Storage slots carry no post-execution check, no emission rights, and no participation in the bijection. Encoding and intrinsic gas charging match EIP-2930 / EIP-7981 exactly, including the constant name `ACCESS_LIST_STORAGE_KEY_COST`.
+
+A type-`TX_TYPE` transaction whose `event_constraint` is `[]` everywhere is therefore observationally identical to a type-`0x02` transaction with the same storage slots, modulo the new type byte and the intrinsic gas line item — confirming the no-regression backwards-compatibility claim in §"Backwards Compatibility".
+
+### Why `0x` for the forbid sentinel
+
+The third position of the entry is a position where the grammar already distinguishes "list" from "string" naturally. Picking the empty string `0x` as the forbid sentinel exploits this existing axis without introducing any new sentinel value or magic byte:
+
+- **Type-disjoint from `[]` at the RLP layer.** `[]` encodes as `0xc0`; `0x` encodes as `0x80`. They differ by exactly RLP's type-tag bit. A decoder distinguishes them before any payload is read, so the choice is unambiguous and unforgeable at the wire level.
+- **Canonical and minimal.** Both `0x` and `[]` have exactly one valid RLP encoding (a single byte each). There is no shorter or alternative encoding either can be silently mutated into, which closes a class of round-trip / re-encoding bugs that magic-byte sentinels (e.g., `0xff`, `0x00`, ASCII `F`) would invite.
+- **Semantically symmetric.** `[]` reads as "empty list of constraints to enumerate" (declarative absence of a bijection); `0x` reads as "empty payload, prohibition only" (declarative absence of any permitted emission). The pair is mnemonic at a glance: list = enumerate; string = prohibit.
+
+Alternatives considered and rejected:
+
+| Alternative | Why rejected |
+|---|---|
+| Drop the case; use 2-tuple `[ADDR, [K]]` for forbid. | Same wire shape carries opposite meaning across tx types: warm-only in 0x02, forbid in `TX_TYPE`. Copy-paste between tx types silently flips semantics. |
+| Reserved magic byte (e.g. `0xff`, `0x00`, `0x46` = ASCII `F`). | Requires a normative "exactly this byte, no other" rule. Tooling can silently mutate to a different byte that round-trips through their internal representations. Adds 1 byte of payload (RLP `0x81 ff`) over the empty-string form. |
+| Sentinel item inside the list (e.g. `[ADDR, [K], [forbid_item]]`). | Conflates the forbid signal with the bijection items, requiring a mixing rule (forbid sentinel may only appear alone). The forbid signal also gets visually buried at a deeper nesting level. |
+| Fourth tuple element (e.g. `[ADDR, [K], [], flags]`). | Breaks the always-3-tuple rule. Adds payload (1+ bytes for the flags item plus its RLP prefix). Conflates a binary choice with a future extension surface. |
+
+### Why an explicit any-emit form
+
+Without an any-emit form the grammar conflates two distinct intents: "this address is unconstrained" and "I forgot to declare this address." Both look identical (the address is simply absent). With `event_constraint = []` the relaxation is signed, rendered, and surfaced — the wallet shows the user "this address may emit anything" instead of silently treating an omission as deliberate. This matters because real flows often touch contracts whose emissions a wallet cannot tightly audit (third-party routers, oracle callbacks, proxy admins); forcing the user to enumerate every emission from such a contract — or to fail to sign — is a common failure mode. The any-emit form gives the user a legible escape that is still part of the signed manifest, so a phishing dapp cannot silently widen a bijection into an any-emit without changing the bytes the user signs over.
 
 ### Composition with Other Standards
 
 **EIP-7702.** The manifest is enforced regardless of whether the transaction uses delegated authority. Combined with 7702, a delegated executor's actions are bounded by the manifest the user signed.
+
+A 7702-delegated EOA executes code at the EOA's own address: when that code emits a log, the `LOG` opcode's emitting address is the EOA itself, not the delegated implementation contract. The signer's own EOA address therefore MUST appear in the access list with an appropriate `event_constraint` (bijection, any-emit, or forbid) whenever the delegated code is expected to emit. Omitting the EOA from the manifest while its delegated code emits triggers the undeclared-emitter revert under §"Matching". Tooling that drafts manifests from a simulation trace MUST attribute logs emitted under a 7702 delegation to the EOA, not to the underlying implementation contract.
 
 **ERC-4337.** A 4337 validator MAY check the manifest as part of `validateUserOp`. The on-chain transaction submitted by the bundler carries the manifest in its access list, and the EL enforces it independently of the bundler.
 
@@ -372,13 +461,13 @@ Throughout, let:
 
 ### Case 1 — Exact bijection (accept)
 
-Access list:
+Access list (each entry is `[address, storage_slots, event_constraint]`):
 
 ```
 [
-  [TOKEN_A, [ [[T, addr32(alice), addr32(POOL)], [u(100)]] ]],
-  [POOL,    [ [[S, addr32(alice)],               [u(100), [[u(40), u(50)]], addr32(alice)]] ]],
-  [TOKEN_B, [ [[T, addr32(POOL),  addr32(alice)], [[[u(40), u(50)]]]] ]]
+  [TOKEN_A, [], [ [[T, addr32(alice), addr32(POOL)], [u(100)]] ]],
+  [POOL,    [], [ [[S, addr32(alice)],               [u(100), [[u(40), u(50)]], addr32(alice)]] ]],
+  [TOKEN_B, [], [ [[T, addr32(POOL),  addr32(alice)], [[[u(40), u(50)]]]] ]]
 ]
 ```
 
@@ -394,7 +483,7 @@ Access list contains `TOKEN_A`'s item twice (identical predicates). `TOKEN_A` em
 
 ### Case 4 — Greedy match: specific-before-broad ordering matters
 
-Access list for `TOKEN_A` (in order):
+Access list contains a single entry `[TOKEN_A, [], [item_specific, item_wildcard]]`, with items in order:
 
 ```
 [
@@ -411,9 +500,13 @@ Reverse the declaration order (wildcard first, specific second), keep emissions 
 
 Access list as in Case 1. During execution, `HELPER` (absent from the access list) emits any log. **Outcome:** revert at the `LOG` opcode that emitted from `HELPER`.
 
-### Case 6 — Storage-only address emits (revert)
+### Case 6 — Forbid sentinel emits (revert)
 
-Access list contains `[HELPER, [ 0x00..01 ]]` (single storage slot, no event items). `HELPER` emits any log. **Outcome:** revert; storage entries grant no emission rights.
+Access list contains `[HELPER, [0x00..01], 0x]` (slot warmed, `event_constraint = 0x`). `HELPER` emits any log. **Outcome:** revert at the `LOG` opcode; the forbid sentinel is a positive prohibition. Storage warming grants no emission rights.
+
+### Case 6b — Any-emit form (accept)
+
+Access list contains `[HELPER, [], []]` (no slots warmed, `event_constraint = []`). `HELPER` emits arbitrary logs during the transaction. **Outcome:** accept; the any-emit form authorizes the emissions and they are not bijection-matched. Wallets MUST render this entry prominently as "may emit any events" (see §"Backwards Compatibility" / Wallet rendering).
 
 ### Case 7 — End-of-tx queue non-empty (revert)
 
@@ -433,27 +526,27 @@ All three MUST yield identical accept/reject outcomes on every log. RLP-encoded 
 
 ### Case 9 — `LOG`-opcode discrimination by `topic_predicates.length`
 
-Access list for `TOKEN_A`:
+Access list contains `[TOKEN_A, [], [ [[T, addr32(alice)], []] ]]` (one item, `topic_predicates.length == 2`, matches `LOG2` only):
 
 ```
-[ [[T, addr32(alice)], []] ]   # topic_predicates.length == 2 → matches LOG2 only
+[ [[T, addr32(alice)], []] ]
 ```
 
 If `TOKEN_A` emits an event with `log.topics.length == 3` (a `LOG3`, e.g. the standard `Transfer(from,to,value)` whose `from` and `to` are both indexed), the item does not match (rule 1), no other item is queued, and the transaction reverts. The wallet must declare the item with 3 topic predicates to target a `LOG3`.
 
 ### Case 10 — Data-length equality
 
-Access list for `POOL`:
+Access list contains `[POOL, [], [ [[S], [u(100), u(45)]] ]]` (`data_predicates.length == 2`):
 
 ```
-[ [[S], [u(100), u(45)]] ]   # data_predicates.length == 2
+[ [[S], [u(100), u(45)]] ]
 ```
 
 If `POOL` emits a `Swap` whose data is 3 words (e.g. an additional non-indexed `address recipient`), `log.data.length / 32 == 3 ≠ 2`. Rule 3 fails; the transaction reverts.
 
 ### Case 11 — Union vs. range distinction
 
-Two access-list entries differ only in one outer pair of brackets around a 2-list at the data-predicate position:
+Two entries for `POOL` (`[POOL, [], <event_constraint>]`) differ only in one outer pair of brackets around a 2-list at the data-predicate position:
 
 ```
 # (a) union of two exacts:  admits value == 40 or value == 50
@@ -496,7 +589,14 @@ A signed manifest is visible to anyone who sees the transaction in the public me
 
 ### Contracts deployed mid-transaction
 
-A contract created during the transaction (via `CREATE` or `CREATE2`) may emit a log from its constructor. Its address — and therefore the access-list entry needed to authorize that emission — is determined by sender, nonce, and (for `CREATE2`) the init code and salt. For `CREATE2` the address is fully predictable at sign time and the wallet SHOULD enumerate it like any other emitter. For `CREATE` the address depends on the sender's nonce at the point of deployment, which in nested-call scenarios depends on intervening state; wallets that cannot statically predict the deployed address from the simulation trace MUST either avoid signing manifests that exercise such patterns or wrap the deployer's emission inside a wider operation that re-emits the relevant events from a stable address. A future EIP MAY add a "transient" address kind (e.g., a per-tx ephemeral marker) to relax this; the current spec keeps the address-keyed coverage rule uniform.
+A contract created during the transaction (via `CREATE` or `CREATE2`) may emit a log from its constructor. The deployed address is deterministic given the transaction and pre-transaction state; the wallet's simulation trace surfaces it directly:
+
+- **CREATE2**: `keccak256(0xff || deployer || salt || keccak256(init_code))[12:]`. Depends only on the deployer, salt, and init code; drift-immune across mempool reorderings.
+- **CREATE**: `keccak256(rlp([deployer, nonce]))[12:]`, where `nonce` is the deployer's nonce at the instant the `CREATE` opcode fires. Within the transaction this is fully determined by the simulation; there is no intra-transaction race.
+
+Wallets MUST enumerate every constructor-emitting deployment surfaced by the trace as an ordinary access-list entry with the predicted address and event constraint.
+
+**CREATE-specific drift.** The deployer's nonce is shared mutable state. Any other transaction landing before this one that causes the same deployer to execute `CREATE` shifts the predicted address. The shifted deployment emits from an address the manifest does not enumerate, triggering the undeclared-emitter revert. This is the same class of state-drift failure the manifest produces for any other shifted observation (e.g., a swap output landing outside a predicate range); it is the intended failure mode, not a special case. Dapps whose flows depend on a deployer contract that frequently CREATEs SHOULD prefer `CREATE2` for emitter deployments, or wrap the constructor's emission with a re-emit from a stable parent address.
 
 ### Composability with reverts
 
