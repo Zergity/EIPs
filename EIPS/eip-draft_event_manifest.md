@@ -30,7 +30,7 @@ The same primitive composes with ERC-7683 cross-chain intents (the manifest expr
 
 The manifest is designed to satisfy three properties simultaneously. Several of the spec's choices look over-engineered or under-engineered in isolation but are forced by the need to satisfy all three at once.
 
-#### 1. Anti-phishing: no unwanted or unexpected emission
+#### 1. Anti-phishing: deterministic enforcement
 
 A signed manifest is binding on the entire transaction's emissions. A phishing site cannot reroute the user's signed call through an unexpected helper contract, smuggle an extra `Approval` past the intended `Swap`, substitute a different recipient, or have the same event fire twice when the user authorized one. Every observable side effect of the transaction is enumerated in the manifest at sign time and re-checked by the EL before state is committed.
 
@@ -38,36 +38,33 @@ The mechanisms that deliver this property:
 
 - **Global emitter whitelist.** Any contract that emits a log must appear in the access list with event items. An undeclared address emitting anything reverts the transaction. This closes the "reroute through an unexpected helper" bypass.
 - **Bijective per-address matching.** For each declared address, every emitted log must pair 1:1 with a declared item. This closes the "smuggle an extra event" bypass and the "fire the same event twice for one signed item" bypass.
-- **Predicate-pinned indexed and data parameters.** Each item constrains topics and data via inclusive ranges. This closes the "substitute a different recipient or amount" bypass.
+- **Predicate-pinned indexed and data parameters.** Each item constrains topics and data values. This closes the "substitute a different recipient or amount" bypass.
 
-#### 2. Cardinality flexibility: events may fire more than once
+Enforcement is deterministic: given the manifest and the surviving emission sequence, the accept/reject decision is fully specified by a single-pass greedy matching algorithm (§"Enforcement"). No oracle calls, no off-chain state, no implementation-defined behavior. The same manifest on the same execution trace produces the same outcome on every conforming client.
 
-Real interactions emit the same event multiple times. A batched transfer emits `Transfer` per recipient; a multi-hop swap emits `Swap` per pool; an `ERC721` mint may emit one `Transfer(0, to, tokenId)` per minted token. The manifest expresses an `N`-fold occurrence by declaring the corresponding event item `N` times; each declaration consumes exactly one emission under the bijection.
+Where overlapping predicates exist (a specific item and a wildcard at the same signature), declaration order is the tiebreaker — the verifier consumes the first applicable item. For a manifest whose items have pairwise non-overlapping predicates — the typical case — emission order does not affect the outcome, since each log can only be consumed by one item; this decouples the manifest from execution-path ordering, so a routing change between sign-time and inclusion (a different pool, a different solver path) does not invalidate the signature when every emission is still individually authorized.
 
-This keeps the grammar minimal — no separate count or multiplicity field, no count predicate language — at the cost of larger manifests for large `N`. The tradeoff is deliberate: every authorized emission costs one signed entry, so a user auditing the manifest can answer "how many `Transfer`s am I authorizing?" by counting items, not by interpreting a count expression. A future EIP MAY add explicit multiplicities (e.g. `[topic_predicates, data_predicates, [min, max]]`) if the size cost of repeated items proves limiting in practice.
+#### 2. Versatile: value matching by exact, range, or union
 
-#### 3. Order independence: emissions may occur in any order (when unambiguous)
+Real outcomes are rarely point values. A swap honors any output `≥ amountOutMin`; a batched approval may target one of several spenders; a multi-hop trade emits one `Swap` per pool. The predicate language admits four forms at every constrainable position:
 
-For a manifest whose items have pairwise non-overlapping predicates — the typical case, where each declared event matches a distinct log — emission order is irrelevant. A swap that emits `Approval` before `Swap` matches the same manifest as one that emits them in reverse, because each log can only be consumed by one declaration. Decoupling the manifest from execution-path ordering is necessary because sub-call order is a routing-level detail the signing user has no reason to fix; a routing change between sign-time and inclusion (a different pool, a different solver path) should not invalidate the signature when every emission is still individually authorized.
+- **Exact**: bare `bytes32 X` — pins one value (signatures, addresses, token IDs).
+- **Range**: `[[min, max]]` — admits `min ≤ value ≤ max` (slippage tolerances, time windows, amount bounds).
+- **Union**: `[a, b, c]` — admits any listed value; members can themselves be ranges, so `[X, [Y, Z]]` admits "exactly X, or anywhere in [Y, Z]".
+- **Wildcard**: `[]` — admits anything (routing-level details, dynamic-data offsets).
 
-Declaration order matters in two cases, both narrow:
+The manifest also expresses cardinality directly: an `N`-fold occurrence of the same event (a batched transfer with `N` recipients, an `N`-pool swap path) is encoded by declaring the corresponding item `N` times. Each declaration consumes exactly one emission under the bijection, so a user auditing the manifest can answer "how many `Transfer`s am I authorizing?" by counting items rather than interpreting a count expression. A future EIP MAY add explicit multiplicities if the size cost of repeated items proves limiting in practice.
 
-- **Multi-fire** (the same predicate declared `N` times): the duplicate declarations are interchangeable under the match, so the user can list them in any order they like; the outcome is the same.
-- **Multi-matched** (two or more items with overlapping predicates — e.g. a specific item and a wildcard at the same signature): the verifier consumes items greedily in declaration order, so a log that satisfies both items is consumed by the one declared first. Wallets SHOULD declare specific items before broader ones; otherwise an emission order that delivers the broad log before the specific one will fail (the specific item gets consumed first and the broad item then has no log to claim, or vice versa).
+This combination — value flexibility per position, cardinality flexibility per item — lets the user express semantically meaningful tolerances ("recipient is one of my known addresses; amount is in `[X, Y]`; exactly two such transfers") rather than only point-equality.
 
-In the multi-matched case, emission order can co-determine the outcome together with declaration order — strict bipartite matching could find a valid pairing where greedy does not. The spec uses greedy because it is implementable as a single pass per `LOG` opcode and matches how users reason about "the next event consumes the next applicable declaration." Wallets that want emission-order independence MUST keep predicates pairwise non-overlapping.
+#### 3. Compatible with ERCs for UX
 
-Order independence (where it holds) does not weaken anti-phishing: the bijection requirement is per-item exact. A reordering that introduces a new event or duplicates an existing one cannot find a matching and reverts.
+The manifest plugs into both standards without modification:
 
-#### How the goals interact
+- **ERC-7683 cross-chain intents.** A 7683 order carries the manifest as the destination-chain outcome commitment. The filler's chain-B transaction must include the same manifest in its access list, and chain B's EVM enforces it under this EIP. The settler on the origin chain verifies the on-chain manifest matches the order's manifest before releasing funds. The user's cross-chain outcome is bound at the protocol level rather than at the settler's discretion.
+- **ERC-7730 clear signing.** The manifest is exactly what the wallet renders to the user — event predicates are ABI-typed and stable across implementation changes (proxy upgrades, internal refactors, storage layout shifts), so 7730 metadata can be authored per event signature rather than per function selector. The rendered surface and the on-chain check are bit-for-bit the same artifact: there is no gap between "what the user saw" and "what the EVM enforced."
 
-These three pull against each other:
-
-- Strict anti-phishing wants to constrain everything, including emission order and cardinality.
-- Multi-fire wants the user to authorize "this event, multiple times" without enumerating each occurrence.
-- Order independence wants the spec to ignore sequencing entirely.
-
-The chosen primitives — per-address global coverage, per-item bijection, value-range predicates over topics and data, ordered tuples for items but unordered set-matching for items-to-logs — form a minimal set that delivers all three. Granting any further freedom (e.g. allowing the same item to discharge multiple logs, or allowing an undeclared address to emit anything) would erode anti-phishing; requiring any further constraint (e.g. order-preserving matching, or one signed entry covering N occurrences) would erode flexibility.
+The design choices above (global coverage, per-item bijection, exact/range/union predicates, declaration-ordered tuples but order-independent set-matching) are the minimal set that satisfies all three goals at once. Granting any further freedom (an undeclared address emitting anything, or one item discharging multiple logs) would erode anti-phishing; requiring any further constraint (order-preserving matching, or a single count predicate covering N occurrences) would erode versatility.
 
 ## Specification
 
