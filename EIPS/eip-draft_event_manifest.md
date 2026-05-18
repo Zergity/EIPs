@@ -2,7 +2,7 @@
 title: Transaction Event Manifest
 description: New transaction type carrying a signed, atomically-enforced declaration of which log events the transaction must emit.
 author: Zergity (@Zergity)
-discussions-to: https://ethereum-magicians.org/t/transaction-event-manifest
+discussions-to: https://ethereum-magicians.org/t/28558
 status: Draft
 type: Standards Track
 category: Core
